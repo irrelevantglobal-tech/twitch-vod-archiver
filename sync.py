@@ -328,26 +328,99 @@ def plan_slices(duration_s, rate, free):
             for i in range(parts) if i * chunk < duration_s]
 
 
+def media_playlist_url(vod):
+    """The media playlist of the rendition `-f best` downloads (one request, nothing downloaded)."""
+    res = subprocess.run(["yt-dlp", "-f", "best", "-g", "--no-warnings", vod["url"]],
+                         capture_output=True, text=True, timeout=120)
+    urls = [u for u in res.stdout.split() if u.startswith("http")]
+    if res.returncode != 0 or not urls:
+        raise RuntimeError(f"yt-dlp gave no playlist URL: {res.stderr[-300:]}")
+    return urls[0]
+
+
+def write_slice_playlist(url, start, end, out_path):
+    """Write a local m3u8 listing only the segments that overlap [start, end), with absolute
+    URLs. Returns the seconds it covers (what the finished file should measure), or None."""
+    res = requests.get(url, timeout=60)
+    res.raise_for_status()
+    base = url.split("?", 1)[0].rsplit("/", 1)[0] + "/"
+    target, picked, t, extinf = "10", [], 0.0, None
+    for line in res.text.splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-TARGETDURATION:"):
+            target = line.split(":", 1)[1]
+        elif line.startswith("#EXTINF:"):
+            extinf = float(line[8:].split(",", 1)[0])
+        elif line and not line.startswith("#") and extinf is not None:
+            # Overlap, not containment: the segment straddling a cut goes in BOTH slices, so
+            # neighbouring parts share a few seconds instead of losing them.
+            if t + extinf > start and t < end:
+                picked.append((extinf, line if "://" in line else base + line))
+            t += extinf
+            extinf = None
+    if not picked:
+        return None
+    with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(f"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:{target}\n"
+                 "#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MEDIA-SEQUENCE:0\n")
+        for d, u in picked:
+            fh.write(f"#EXTINF:{d:.3f},\n{u}\n")
+        fh.write("#EXT-X-ENDLIST\n")
+    return sum(d for d, _ in picked)
+
+
+def download_slice(vod, path, start, end, timeout):
+    """One time slice, written straight to mp4 by ffmpeg. Returns the seconds it should
+    measure, or False.
+
+    NEVER seek with -ss (which is what yt-dlp --download-sections does). MPEG-TS timestamps
+    are 33 bits at 90 kHz, so they WRAP back to zero every 26h30m. ffmpeg's HLS seek picks
+    the right segment, then throws packets away until one is stamped at or after the target.
+    Past the wrap no packet ever is: it read the whole rest of the VOD, wrote nothing,
+    exited 0, and every run failed the length check on the same slice. Found 2026-10-02 on a
+    48h stream whose Parts 4 and 5 (both after the wrap) could never be archived. Handing
+    ffmpeg a playlist of just this slice's segments means there is no seek at all, and its
+    normal wrap correction (relative to the first packet) handles a slice that crosses one.
+    """
+    m3u8 = path + ".m3u8"   # _tmp_ prefix, so wipe_temp() removes it with the rest
+    try:
+        covered = write_slice_playlist(media_playlist_url(vod), start, end, m3u8)
+    except Exception as exc:  # noqa: BLE001
+        log(f"  could not build the slice playlist: {exc}")
+        return False
+    if not covered:
+        log("  the slice holds no segments; not downloading")
+        return False
+    # ffmpeg's HLS reader does NOT retry a failed segment by default, so one transient CDN
+    # error silently drops a few seconds while the file still reports the right duration
+    # (fault-injection test: a single 500 lost a segment). The retries fix that case, and
+    # the read timeout stops a stalled connection hanging the job until it is killed. A
+    # segment that keeps failing is skipped, and biggest_gap() then catches the hole.
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+           "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+           "-seg_max_retry", "10", "-rw_timeout", "60000000",
+           "-i", m3u8,
+           "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-bsf:a", "aac_adtstoasc",
+           "-f", "mp4", path]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log(f"  ffmpeg still running after {timeout}s; stopped it")
+        return False
+    if res.returncode != 0:
+        log(f"  ffmpeg failed: {res.stderr[-400:]}")
+        return False
+    return covered if os.path.exists(path) else False
+
+
 def download(vod, path, start=None, end=None, expect_bytes=None):
-    cmd = ["yt-dlp", "-f", "best", "--no-progress", "--no-warnings"]
-    if start is not None:
-        # Slice mode hands the range to ffmpeg, which writes the final mp4 in one pass.
-        # Cuts land on the keyframe at/before `start`, so neighbouring slices can overlap
-        # by a couple of seconds. Fine for an archive.
-        cmd += ["--download-sections", f"*{int(start)}-{int(end)}"]
-        # ffmpeg's HLS reader does NOT retry a failed segment by default, so one
-        # transient CDN error silently drops a few seconds while the file still reports
-        # the right duration (fault-injection test: a single 500 lost a segment in slice
-        # mode; native mode had retried it). The retries fix that case, and the read
-        # timeout stops a stalled connection hanging the job until it is killed. A segment
-        # that keeps failing is still skipped, exactly as in native mode.
-        cmd += ["--downloader-args",
-                "ffmpeg_i:-seg_max_retry 10 -reconnect 1 -reconnect_streamed 1 "
-                "-reconnect_on_network_error 1 -reconnect_delay_max 30 -rw_timeout 60000000"]
-    else:
-        cmd += ["--fixup", "never"]   # see NATIVE_FACTOR: one file on disk, not two
-    cmd += ["-o", path, vod["url"]]
+    """True (whole VOD) or the slice's expected seconds when it worked; False when not."""
     timeout = int(est_seconds(expect_bytes)) if expect_bytes else None
+    if start is not None:
+        return download_slice(vod, path, start, end, timeout)
+    cmd = ["yt-dlp", "-f", "best", "--no-progress", "--no-warnings",
+           "--fixup", "never",   # see NATIVE_FACTOR: one file on disk, not two
+           "-o", path, vod["url"]]
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -629,8 +702,11 @@ def main():
                     log(f"  -- part {idx}/{len(parts)}  {a / 3600:.2f}h -> {b / 3600:.2f}h")
                 ok = False
                 for attempt in (1, 2):
-                    if not download(v, path, a, b, expect_bytes=need):
+                    got = download(v, path, a, b, expect_bytes=need)
+                    if not got:
                         break
+                    if a is not None:
+                        expected = got   # cut on segment boundaries: a few seconds over b - a
                     if not looks_complete(path, expected, min_bytes=int(need * 0.5)):
                         break
                     ok = True
